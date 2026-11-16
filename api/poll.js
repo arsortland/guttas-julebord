@@ -36,10 +36,33 @@ function parseHash(flat) {
   return items;
 }
 
+// Samme navn = samme person, uansett nettleser. Store/små bokstaver og ekstra mellomrom ses bort fra.
+const nameKey = (name) => String(name ?? '').normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim();
+
+// Slår sammen rader med samme navn (eldre rader ble lagret per nettleser): valgene legges sammen.
+function mergeByName(rows) {
+  const byName = new Map();
+  for (const r of rows) {
+    const key = nameKey(r.name);
+    if (!key) continue;
+    const hit = byName.get(key);
+    if (!hit) {
+      byName.set(key, { name: r.name, dates: [...(r.dates || [])], places: [...(r.places || [])], at: r.at || 0 });
+    } else {
+      hit.dates = [...new Set([...hit.dates, ...(r.dates || [])])];
+      hit.places = [...new Set([...hit.places, ...(r.places || [])])];
+      hit.at = Math.min(hit.at, r.at || 0);
+    }
+  }
+  return [...byName.values()];
+}
+
 async function readState() {
   const [votes, places] = await redis([['HGETALL', VOTES], ['HGETALL', PLACES]]);
+  const rawVotes = parseHash(votes).sort((a, b) => (a.at || 0) - (b.at || 0));
   return {
-    votes: parseHash(votes).sort((a, b) => (a.at || 0) - (b.at || 0)),
+    rawVotes,
+    votes: mergeByName(rawVotes),
     places: parseHash(places).sort((a, b) => (a.at || 0) - (b.at || 0)),
   };
 }
@@ -47,7 +70,7 @@ async function readState() {
 // Det nettleseren får se: andres velger-ID-er holdes tilbake, egne rader merkes.
 function publicState(state, voterId) {
   return {
-    votes: state.votes.map((v) => ({ name: v.name, dates: v.dates, places: v.places, mine: v.id === voterId })),
+    votes: state.votes.map((v) => ({ name: v.name, dates: v.dates, places: v.places })),
     places: state.places.map((p) => ({ id: p.id, name: p.name, canDelete: !p.by || p.by === voterId })),
   };
 }
@@ -91,16 +114,27 @@ export default {
         const name = clean(body.name, 30);
         if (!name) return json({ error: 'Skriv inn navnet ditt først.' }, 400);
 
+        const key = nameKey(name);
         const state = await readState();
-        const known = state.votes.some((v) => v.id === voterId);
-        if (!known && state.votes.length >= MAX_VOTERS) return json({ error: 'Avstemningen er full.' }, 400);
+        const existing = state.votes.find((v) => nameKey(v.name) === key);
+        if (!existing && state.votes.length >= MAX_VOTERS) return json({ error: 'Avstemningen er full.' }, 400);
 
         const placeIds = new Set(state.places.map((p) => p.id));
         const dates = [...new Set(Array.isArray(body.dates) ? body.dates : [])].filter((d) => DATE_IDS.includes(d));
         const places = [...new Set(Array.isArray(body.places) ? body.places : [])].filter((p) => placeIds.has(p));
-        const at = state.votes.find((v) => v.id === voterId)?.at || Date.now();
+        const at = existing?.at || Date.now();
 
-        await redis([['HSET', VOTES, voterId, JSON.stringify({ name, dates, places, at })]]);
+        // Én rad per navn. Andre rader med samme navn fjernes, og ved navnebytte også raden under det gamle navnet.
+        const field = 'n:' + key;
+        const prevKey = nameKey(clean(body.prevName, 30));
+        const stale = state.rawVotes
+          .filter((r) => r.id !== field && (nameKey(r.name) === key || r.id === voterId || (prevKey && nameKey(r.name) === prevKey)))
+          .map((r) => r.id);
+        // Første skrivemåte av navnet beholdes, så «andré» fra mobilen ikke endrer «André».
+        const shown = existing?.name || name;
+        const commands = [['HSET', VOTES, field, JSON.stringify({ name: shown, dates, places, at })]];
+        if (stale.length) commands.push(['HDEL', VOTES, ...stale]);
+        await redis(commands);
         return json(publicState(await readState(), voterId));
       }
 

@@ -160,13 +160,14 @@
     <h1>Guttas julebord</h1>
     <div class="year">anno 2026</div>
     <div class="orn" aria-hidden="true">❄ ★ ❄</div>
-    <p>Kryss av alle datoene du kan, og stem på eller foreslå sted. Du kan endre svarene dine når som helst.</p>
+    <p>Kryss av alle datoene du kan, og stem på eller foreslå sted. Du kan endre svarene dine når som helst, også fra en annen enhet: bruk bare samme navn.</p>
   </header>
 
   <section>
     <span class="tag" aria-hidden="true">🎅</span>
     <label for="name">Hva heter du?</label>
     <input type="text" id="name" maxlength="30" autocomplete="given-name" placeholder="Navnet ditt">
+    <p class="hint" style="margin:8px 0 0">Navnet er stemmeseddelen din: samme navn telles som én person.</p>
   </section>
 
   <section>
@@ -241,7 +242,13 @@
 
   const mine = { dates: new Set(), places: new Set() };
   let server = { votes: [], places: [] };
-  let loaded = false, hydrated = false, dirty = false, saving = false, saveTimer = null, lastOk = 0;
+  // Samme navn = samme person, uansett nettleser (må regnes ut likt som på serveren).
+  const nameKey = (name) => String(name || '').normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim();
+  const myKey = () => nameKey($('name').value);
+  const myRecord = () => { const k = myKey(); return k ? server.votes.find((v) => nameKey(v.name) === k) : undefined; };
+  let savedKey = '';          // navnet valgene mine sist ble hentet fra eller lagret på
+  let nameSync = null;        // pågående henting etter at navnet ble endret
+  let loaded = false, dirty = false, saving = false, saveTimer = null, lastOk = 0;
 
   $('name').value = store.get('jb-name') || '';
 
@@ -259,8 +266,9 @@
   // Stemmene slik de skal vises: serverens, med mine egne ulagrede valg lagt oppå.
   function tally(kind, id) {
     const names = [];
+    const me = myKey();
     for (const v of server.votes) {
-      if (v.mine) continue;
+      if (me && nameKey(v.name) === me) continue;
       if ((v[kind] || []).includes(id)) names.push(v.name);
     }
     if (mine[kind].has(id)) names.push(($('name').value.trim() || 'Du') + ' (deg)');
@@ -493,7 +501,7 @@
     const dateRows = DATES.map((d) => ({ ...d, names: tally('dates', d.id) }));
     const placeRows = server.places.map((p) => ({ ...p, names: tally('places', p.id) }));
     const iVoted = mine.dates.size > 0 || mine.places.size > 0;
-    const voters = server.votes.filter((v) => !v.mine && ((v.dates || []).length || (v.places || []).some((id) => server.places.some((p) => p.id === id)))).length + (iVoted ? 1 : 0);
+    const voters = server.votes.filter((v) => nameKey(v.name) !== myKey() && ((v.dates || []).length || (v.places || []).some((id) => server.places.some((p) => p.id === id)))).length + (iVoted ? 1 : 0);
     const sig = JSON.stringify([dateRows.map((r) => r.names), placeRows.map((r) => [r.id, r.name, r.names]), voters]);
     if (sig === statsSig) return;
     statsSig = sig;
@@ -576,20 +584,19 @@
     }
   }
 
+  // Valgene mine er det som står lagret på navnet mitt, også når det ble lagret fra en annen nettleser.
+  function adopt() {
+    const rec = myRecord();
+    if (rec) savedKey = myKey();
+    mine.dates = new Set(rec ? rec.dates || [] : []);
+    mine.places = new Set(rec ? rec.places || [] : []);
+  }
+
   function applyServer(data) {
     server = { votes: data.votes || [], places: data.places || [] };
     loaded = true;
     lastOk = Date.now();
-    const my = server.votes.find((v) => v.mine);
-    // Hent mine lagrede valg første gang; etterpå styrer det jeg har trykket på her.
-    if (!hydrated) {
-      hydrated = true;
-      if (my) {
-        mine.dates = new Set(my.dates || []);
-        mine.places = new Set(my.places || []);
-        if (!$('name').value) $('name').value = my.name || '';
-      }
-    }
+    adopt();
     const count = server.votes.filter((v) => (v.dates || []).length || (v.places || []).length).length;
     setStatus(count + (count === 1 ? ' har stemt' : ' har stemt') + ' · oppdateres automatisk');
     // Steder som er slettet av den som la dem inn, skal ikke bli hengende i mine valg.
@@ -624,8 +631,11 @@
     return true;
   }
 
-  function toggle(kind, id) {
+  async function toggle(kind, id) {
     if (needName()) return;
+    // Navnet er nettopp endret: vent til det som alt er lagret på navnet er hentet, så ingenting overskrives.
+    if (nameSync) await nameSync;
+    if (!dirty && !saving && myKey() !== savedKey && myRecord()) adopt();
     mine[kind].has(id) ? mine[kind].delete(id) : mine[kind].add(id);
     render();
     queueSave();
@@ -647,9 +657,10 @@
       const data = await call({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'vote', voterId, name, dates: [...mine.dates], places: [...mine.places] }),
+        body: JSON.stringify({ action: 'vote', voterId, name, prevName: savedKey, dates: [...mine.dates], places: [...mine.places] }),
       });
       saving = false;
+      savedKey = nameKey(name);
       if (!dirty) applyServer(data);
     } catch (e) {
       saving = false;
@@ -665,7 +676,17 @@
     if (input.value.trim()) input.classList.remove('missing');
     store.set('jb-name', input.value.trim());
     render();
-    if (mine.dates.size || mine.places.size) queueSave();
+  });
+  // Når navnet er ferdig skrevet: finnes det allerede, henter vi de lagrede valgene. Ellers flyttes valgene mine til det nye navnet.
+  $('name').addEventListener('change', () => {
+    if (dirty || saving || !myKey() || myKey() === savedKey) return;
+    nameSync = (async () => {
+      try { server = { votes: [], places: [], ...(await call()) }; lastOk = Date.now(); } catch {}
+      if (myRecord()) adopt();
+      else if (mine.dates.size || mine.places.size) queueSave();
+      render();
+      nameSync = null;
+    })();
   });
 
   $('addForm').addEventListener('submit', async (e) => {
