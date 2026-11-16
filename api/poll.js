@@ -44,6 +44,16 @@ async function readState() {
   };
 }
 
+// Det nettleseren får se: andres velger-ID-er holdes tilbake, egne rader merkes.
+function publicState(state, voterId) {
+  return {
+    votes: state.votes.map((v) => ({ name: v.name, dates: v.dates, places: v.places, mine: v.id === voterId })),
+    places: state.places.map((p) => ({ id: p.id, name: p.name, canDelete: !p.by || p.by === voterId })),
+  };
+}
+
+const validVoter = (id) => /^[a-zA-Z0-9-]{8,40}$/.test(id);
+
 const clean = (s, max) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 const placeId = (name) =>
   name.toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
@@ -62,7 +72,10 @@ export default {
       return json({ error: 'Databasen er ikke koblet til ennå (mangler Upstash Redis i Vercel).' }, 503);
     }
     try {
-      if (request.method === 'GET') return json(await readState());
+      if (request.method === 'GET') {
+        const v = clean(new URL(request.url).searchParams.get('v'), 40);
+        return json(publicState(await readState(), v));
+      }
       if (request.method !== 'POST') return json({ error: 'Metoden støttes ikke.' }, 405);
 
       let body;
@@ -71,11 +84,11 @@ export default {
       } catch {
         return json({ error: 'Ugyldig forespørsel.' }, 400);
       }
+      const voterId = clean(body.voterId, 40);
+      if (!validVoter(voterId)) return json({ error: 'Ugyldig velger-ID.' }, 400);
 
       if (body.action === 'vote') {
-        const voterId = clean(body.voterId, 40);
         const name = clean(body.name, 30);
-        if (!/^[a-zA-Z0-9-]{8,40}$/.test(voterId)) return json({ error: 'Ugyldig velger-ID.' }, 400);
         if (!name) return json({ error: 'Skriv inn navnet ditt først.' }, 400);
 
         const state = await readState();
@@ -88,7 +101,7 @@ export default {
         const at = state.votes.find((v) => v.id === voterId)?.at || Date.now();
 
         await redis([['HSET', VOTES, voterId, JSON.stringify({ name, dates, places, at })]]);
-        return json(await readState());
+        return json(publicState(await readState(), voterId));
       }
 
       if (body.action === 'addPlace') {
@@ -99,9 +112,21 @@ export default {
         if (!state.places.some((p) => p.id === id)) {
           if (state.places.length >= MAX_PLACES) return json({ error: 'Det er nok forslag nå.' }, 400);
           // HSETNX: to som foreslår samme sted samtidig gir bare ett forslag
-          await redis([['HSETNX', PLACES, id, JSON.stringify({ name, at: Date.now() })]]);
+          await redis([['HSETNX', PLACES, id, JSON.stringify({ name, at: Date.now(), by: voterId })]]);
         }
-        return json({ ...(await readState()), placeId: id });
+        return json({ ...publicState(await readState(), voterId), placeId: id });
+      }
+
+      if (body.action === 'deletePlace') {
+        const id = clean(body.placeId, 60);
+        const state = await readState();
+        const place = state.places.find((p) => p.id === id);
+        if (place) {
+          // Bare den som la inn stedet kan slette det.
+          if (place.by && place.by !== voterId) return json({ error: 'Bare den som la inn stedet kan slette det.' }, 403);
+          await redis([['HDEL', PLACES, id]]);
+        }
+        return json(publicState(await readState(), voterId));
       }
 
       return json({ error: 'Ukjent handling.' }, 400);

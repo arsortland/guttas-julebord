@@ -64,6 +64,13 @@
   .lead { font-size: 12px; color: var(--accent); font-weight: 600; white-space: nowrap; }
   .count { font-variant-numeric: tabular-nums; font-weight: 700; min-width: 1.5em; text-align: right; }
   .who { position: relative; color: var(--muted); font-size: 13px; margin: 4px 0 0 32px; overflow-wrap: anywhere; }
+  .place { display: flex; gap: 8px; align-items: stretch; margin-top: 8px; }
+  .place .opt { margin-top: 0; flex: 1; min-width: 0; }
+  .del {
+    flex: none; padding: 0 12px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+    color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 10px;
+  }
+  .del.sure { color: #2a0b07; background: var(--danger); border-color: var(--danger); }
   .add { display: flex; gap: 8px; margin-top: 12px; }
   .add input { flex: 1; min-width: 0; }
   .btn {
@@ -100,7 +107,7 @@
 
   <section>
     <h2>Hvor skal vi være?</h2>
-    <p class="hint">Stem på ett eller flere steder, eller legg til ditt eget forslag.</p>
+    <p class="hint">Stem på ett eller flere steder, eller legg til ditt eget forslag. Forslag du selv har lagt inn, kan du slette.</p>
     <div id="places"></div>
     <form class="add" id="addForm">
       <input type="text" id="placeInput" maxlength="50" placeholder="Foreslå et sted" aria-label="Foreslå et sted">
@@ -157,7 +164,7 @@
   function tally(kind, id) {
     const names = [];
     for (const v of server.votes) {
-      if (v.id === voterId) continue;
+      if (v.mine) continue;
       if ((v[kind] || []).includes(id)) names.push(v.name);
     }
     if (mine[kind].has(id)) names.push(($('name').value.trim() || 'Du') + ' (deg)');
@@ -233,7 +240,53 @@
     } else {
       const placeMax = Math.max(0, ...server.places.map((p) => tally('places', p.id).length));
       const sorted = [...server.places].sort((a, b) => tally('places', b.id).length - tally('places', a.id).length);
-      for (const p of sorted) placesEl.append(option('places', p.id, p.name, placeMax));
+      for (const p of sorted) {
+        const wrap = document.createElement('div');
+        wrap.className = 'place';
+        wrap.append(option('places', p.id, p.name, placeMax));
+        if (p.canDelete) wrap.append(deleteButton(p));
+        placesEl.append(wrap);
+      }
+    }
+  }
+
+  // Sletting i to trykk: «Slett» og så «Sikker?», slik at et feiltrykk ikke fjerner noe.
+  let armed = null, armTimer = null;
+  function deleteButton(place) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    const sure = armed === place.id;
+    btn.className = 'del' + (sure ? ' sure' : '');
+    btn.textContent = sure ? 'Sikker?' : 'Slett';
+    btn.setAttribute('aria-label', (sure ? 'Bekreft sletting av ' : 'Slett ') + place.name);
+    btn.addEventListener('click', () => {
+      clearTimeout(armTimer);
+      if (armed !== place.id) {
+        armed = place.id;
+        armTimer = setTimeout(() => { armed = null; render(); }, 4000);
+        render();
+        return;
+      }
+      armed = null;
+      removePlace(place.id);
+    });
+    return btn;
+  }
+
+  async function removePlace(id) {
+    try {
+      const data = await call({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'deletePlace', voterId, placeId: id }),
+      });
+      mine.places.delete(id);
+      server.places = data.places || [];
+      server.votes = data.votes || server.votes;
+      render();
+    } catch (e) {
+      setStatus(e.message, true);
+      render();
     }
   }
 
@@ -241,7 +294,7 @@
     server = { votes: data.votes || [], places: data.places || [] };
     loaded = true;
     lastOk = Date.now();
-    const my = server.votes.find((v) => v.id === voterId);
+    const my = server.votes.find((v) => v.mine);
     // Hent mine lagrede valg første gang; etterpå styrer det jeg har trykket på her.
     if (!hydrated) {
       hydrated = true;
@@ -253,11 +306,14 @@
     }
     const count = server.votes.filter((v) => (v.dates || []).length || (v.places || []).length).length;
     setStatus(count + (count === 1 ? ' har stemt' : ' har stemt') + ' · oppdateres automatisk');
+    // Steder som er slettet av den som la dem inn, skal ikke bli hengende i mine valg.
+    const ids = new Set(server.places.map((p) => p.id));
+    for (const id of mine.places) if (!ids.has(id)) mine.places.delete(id);
     render();
   }
 
   async function call(options) {
-    const res = await fetch(API, { cache: 'no-store', ...options });
+    const res = await fetch(API + '?v=' + encodeURIComponent(voterId), { cache: 'no-store', ...options });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Fikk ikke kontakt med serveren.');
     return data;
@@ -337,7 +393,7 @@
       const data = await call({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'addPlace', name }),
+        body: JSON.stringify({ action: 'addPlace', voterId, name }),
       });
       input.value = '';
       server.places = data.places || server.places;
