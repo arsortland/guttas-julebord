@@ -1,0 +1,7 @@
+{
+  "name": "guttas-julebord",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Avstemning for Guttas julebord: dato og sted, med liveresultater"
+}
